@@ -18,7 +18,9 @@ from bhume.score import score
 from src.alignment import BoundaryRaster, estimate_global_shift, run_alignment
 from src.confidence import run_confidence
 from src.evaluation import compare_against_truths, plot_comparison, print_comparison
+from src.flagging import DEFAULT_THRESHOLD, apply_decisions, decisions_to_geodataframe
 from src.image_signals import ImageRaster
+from src.neighborhood import apply_neighbourhood_to_confidence, build_neighborhood_context
 from src.visualization import render_truth_plots
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -72,12 +74,15 @@ def main():
         use_image=True, w_boundary=0.6, w_image=0.4,
     )
 
-    # confidence
+    # confidence + neighbourhood
     print("\nComputing confidence scores...")
-    conf_results = run_confidence(results, global_shift, village, braster, iraster)
+    conf_base    = run_confidence(results, global_shift, village, braster, iraster)
+    ctx          = build_neighborhood_context(results, conf_base, global_shift, village)
+    conf_results = apply_neighbourhood_to_confidence(results, conf_base, ctx, village)
 
-    # build predictions
-    preds = build_predictions(results, conf_results)
+    # decisions
+    decisions    = apply_decisions(results, conf_results, threshold=DEFAULT_THRESHOLD)
+    preds        = decisions_to_geodataframe(decisions)
 
     # score
     print("\n--- bhume scorer ---")
