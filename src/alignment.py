@@ -1,3 +1,37 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 """
 Phase 3: Alignment pipeline.
 
@@ -334,15 +368,7 @@ def local_refine(
                 best_dx    = float(tx)
                 best_dy    = float(ty)
 
-    return LocalResult(
-        extra_dx_m      = best_dx,
-        extra_dy_m      = best_dy,
-        score_before    = score_before,
-        score_after     = best_score,
-        score_gap       = best_score - score_before,
-        search_radius_m = search_radius_m,
-        step_m          = step_m,
-    )
+# (local_refine is now _local_refine_combined — see align_plot)
 
 
 # ---------------------------------------------------------------------------
@@ -354,13 +380,20 @@ def align_plot(
     geom_4326: BaseGeometry,
     global_shift: GlobalShift,
     braster: "BoundaryRaster | None",
+    iraster: "object | None" = None,   # ImageRaster | None
     search_radius_m: float = 16.0,
     step_m: float = 2.0,
     band_m: float = 3.0,
+    w_boundary: float = 0.6,
+    w_image: float = 0.4,
 ) -> AlignmentResult:
     """
-    Apply global shift then optionally refine locally using BoundaryRaster.
-    All geometry operations in UTM; output back in EPSG:4326.
+    Apply global shift then refine locally using a combined signal:
+      - boundary hint perimeter score  (weight w_boundary)
+      - image gradient perimeter score (weight w_image, if iraster provided)
+
+    Both signals use the rasterize-once / pixel-shift pattern — fast.
+    All geometry in UTM; output in EPSG:4326.
     """
     tf_to_utm  = _get_tf("EPSG:4326", UTM_ZONE)
     tf_to_4326 = _get_tf(UTM_ZONE, "EPSG:4326")
@@ -369,9 +402,12 @@ def align_plot(
     shifted_utm = translate(geom_utm, global_shift.dx_m, global_shift.dy_m)
 
     if braster is not None:
-        local = local_refine(shifted_utm, braster,
-                             search_radius_m=search_radius_m,
-                             step_m=step_m, band_m=band_m)
+        local = _local_refine_combined(
+            shifted_utm, braster, iraster,
+            search_radius_m=search_radius_m,
+            step_m=step_m, band_m=band_m,
+            w_boundary=w_boundary, w_image=w_image,
+        )
         final_utm = translate(shifted_utm, local.extra_dx_m, local.extra_dy_m)
     else:
         local     = LocalResult(0.0, 0.0, 0.0, 0.0, 0.0, search_radius_m, step_m)
@@ -393,6 +429,130 @@ def align_plot(
     )
 
 
+def _local_refine_combined(
+    geom_utm: BaseGeometry,
+    braster: "BoundaryRaster",
+    iraster: "object | None",
+    search_radius_m: float,
+    step_m: float,
+    band_m: float,
+    w_boundary: float,
+    w_image: float,
+) -> LocalResult:
+    """
+    Combined boundary + image scorer using the fast pixel-shift method.
+    Builds both scorers once, then sweeps the grid with a weighted sum.
+    """
+    # ── boundary scorer ──────────────────────────────────────────────────────
+    b_score_fn, b_score_0 = _build_boundary_scorer(
+        geom_utm, braster, search_radius_m, band_m
+    )
+
+    # ── image scorer (optional) ───────────────────────────────────────────────
+    if iraster is not None:
+        from src.image_signals import build_image_scorer
+        i_score_fn, i_score_0 = build_image_scorer(
+            geom_utm, iraster, search_radius_m, band_m
+        )
+        use_image = True
+    else:
+        i_score_fn = lambda px_dx, px_dy: 0.0
+        i_score_0  = 0.0
+        use_image  = False
+        w_boundary, w_image = 1.0, 0.0
+
+    def combined(px_dx, px_dy):
+        b = b_score_fn(px_dx, px_dy)
+        i = i_score_fn(px_dx, px_dy) if use_image else 0.0
+        return w_boundary * b + w_image * i
+
+    score_before = combined(0, 0)
+    best_score   = score_before
+    best_dx = best_dy = 0.0
+
+    steps = np.arange(-search_radius_m, search_radius_m + step_m, step_m)
+    res   = braster.res_m
+    for tx in steps:
+        for ty in steps:
+            if math.hypot(tx, ty) > search_radius_m:
+                continue
+            px_dx = int(round(tx  / res))
+            px_dy = int(round(-ty / res))
+            sc    = combined(px_dx, px_dy)
+            if sc > best_score:
+                best_score = sc
+                best_dx    = float(tx)
+                best_dy    = float(ty)
+
+    return LocalResult(
+        extra_dx_m      = best_dx,
+        extra_dy_m      = best_dy,
+        score_before    = score_before,
+        score_after     = best_score,
+        score_gap       = best_score - score_before,
+        search_radius_m = search_radius_m,
+        step_m          = step_m,
+    )
+
+
+def _build_boundary_scorer(
+    geom_utm: BaseGeometry,
+    braster: "BoundaryRaster",
+    search_radius_m: float,
+    band_m: float,
+):
+    """Build fast pixel-shift boundary scorer. Returns (score_fn, score_at_origin)."""
+    geom_3857 = _reproject(geom_utm, UTM_ZONE, "EPSG:3857")
+    outer = geom_3857.buffer(band_m)
+    inner = geom_3857.buffer(-band_m)
+    band  = outer.difference(inner) if not inner.is_empty else outer
+
+    pad = search_radius_m + band_m + braster.res_m * 2
+    b   = band.bounds
+    tf  = braster.transform
+    W, H = braster.data.shape[1], braster.data.shape[0]
+
+    col_min = max(0, int((b[0]-pad - tf.c) / tf.a))
+    col_max = min(W, int((b[2]+pad - tf.c) / tf.a) + 1)
+    row_min = max(0, int((b[3]+pad - tf.f) / tf.e))
+    row_max = min(H, int((b[1]-pad - tf.f) / tf.e) + 1)
+
+    if col_max <= col_min or row_max <= row_min:
+        def _zero(px_dx, px_dy): return 0.0
+        return _zero, 0.0
+
+    edge_crop = braster.data[row_min:row_max, col_min:col_max]
+    ch, cw    = edge_crop.shape
+
+    from rasterio.transform import from_bounds as tfb
+    crop_left  = tf.c + col_min * tf.a
+    crop_top   = tf.f + row_min * tf.e
+    crop_right = tf.c + col_max * tf.a
+    crop_bot   = tf.f + row_max * tf.e
+    win_tf     = tfb(crop_left, crop_bot, crop_right, crop_top, cw, ch)
+
+    band_mask = rasterize(
+        [band], out_shape=(ch, cw), transform=win_tf,
+        fill=0, default_value=1, dtype=np.uint8,
+    ).astype(bool)
+
+    def _score(px_dx: int, px_dy: int) -> float:
+        r0s = max(0, -px_dy); r1s = min(ch, ch - px_dy)
+        c0s = max(0, -px_dx); c1s = min(cw, cw - px_dx)
+        r0e = max(0,  px_dy); r1e = min(ch, ch + px_dy)
+        c0e = max(0,  px_dx); c1e = min(cw, cw + px_dx)
+        if r1s<=r0s or c1s<=c0s or r1e<=r0e or c1e<=c0e:
+            return 0.0
+        m  = band_mask[r0s:r1s, c0s:c1s]
+        ec = edge_crop[r0e:r1e, c0e:c1e]
+        if m.shape != ec.shape:
+            return 0.0
+        bp = int(m.sum())
+        return float((m & ec).sum() / bp) if bp > 0 else 0.0
+
+    return _score, _score(0, 0)
+
+
 # ---------------------------------------------------------------------------
 # Village-wide pipeline
 # ---------------------------------------------------------------------------
@@ -402,40 +562,50 @@ def run_alignment(
     search_radius_m: float = 16.0,
     step_m: float = 2.0,
     band_m: float = 3.0,
+    use_image: bool = True,
+    w_boundary: float = 0.6,
+    w_image: float = 0.4,
 ) -> tuple[GlobalShift, list[AlignmentResult]]:
     """
     Align every plot in the village.
-    Loads BoundaryRaster once into RAM, then processes all plots.
+    Loads BoundaryRaster (and optionally ImageRaster) once into RAM.
     Returns (global_shift, list[AlignmentResult]).
     """
     global_shift = estimate_global_shift(village)
 
     braster = (
         BoundaryRaster.load(village.boundaries_path)
-        if village.boundaries_path
-        else None
+        if village.boundaries_path else None
     )
     if braster:
-        log.info("Loaded boundary raster into RAM: %s px, res=%.2fm",
+        log.info("Loaded boundary raster: %d px, res=%.2fm",
                  braster.data.size, braster.res_m)
 
-    results: list[AlignmentResult] = []
-    plots = village.plots
+    iraster = None
+    if use_image and village.imagery_path and village.imagery_path.exists():
+        from src.image_signals import ImageRaster
+        iraster = ImageRaster.load(village.imagery_path)
+        log.info("Loaded imagery raster: %s, res=%.2fm",
+                 iraster.edge_mag.shape, iraster.res_m)
 
-    for pn in plots.index:
-        geom   = plots.loc[pn, "geometry"]
+    results: list[AlignmentResult] = []
+    for pn in village.plots.index:
+        geom   = village.plots.loc[pn, "geometry"]
         result = align_plot(
             plot_number     = str(pn),
             geom_4326       = geom,
             global_shift    = global_shift,
             braster         = braster,
+            iraster         = iraster,
             search_radius_m = search_radius_m,
             step_m          = step_m,
             band_m          = band_m,
+            w_boundary      = w_boundary,
+            w_image         = w_image,
         )
         results.append(result)
         if len(results) % 200 == 0:
-            log.info("Aligned %d / %d plots", len(results), len(plots))
+            log.info("Aligned %d / %d plots", len(results), len(village.plots))
 
     log.info("Alignment complete: %d plots", len(results))
     return global_shift, results
