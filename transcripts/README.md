@@ -31,6 +31,10 @@ take-home assignment, as required by the submission contract.
 |---|---|
 | `chatgpt_summary.md` | Summary of ChatGPT discussions covering problem understanding, strategy design, and key technical decisions |
 | `kiro_summary.md` | Phase-by-phase record of the Kiro implementation session — what was built, findings, bugs fixed, and outcomes |
+| `kiro_raw-transcript.md` | Raw transcript of the full Kiro IDE implementation session |
+
+> Raw transcripts are included so reviewers can inspect the exact prompts,
+> responses, and iterative decisions made throughout the project.
 
 ---
 
